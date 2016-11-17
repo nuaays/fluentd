@@ -22,6 +22,8 @@ require 'socket'
 require 'ipaddr'
 require 'fcntl'
 
+require 'forwardable'
+
 module Fluent
   module PluginHelper
     module Server
@@ -62,10 +64,20 @@ module Fluent
       #   end
       # end
       def server_create_connection(title, port, proto: :tcp, bind: '0.0.0.0', shared: true, certopts: nil, resolve_name: false, linger_timeout: 0, backlog: nil, &block)
-        raise ArgumentError, "BUG: title must be a symbol" unless title.is_a? Symbol
+        raise ArgumentError, "BUG: title must be a symbol" unless title && title.is_a?(Symbol)
+        raise ArgumentError, "BUG: port must be an integer" unless port && port.is_a?(Integer)
+        raise ArgumentError, "BUG: invalid protocol name" unless PROTOCOLS.include?(proto)
         raise ArgumentError, "BUG: cannot create connection for UDP" unless CONNECTION_PROTOCOLS.include?(proto)
+
         raise ArgumentError, "BUG: block not specified which handles connection" unless block_given?
         raise ArgumentError, "BUG: block must have just one argument" unless block.arity == 1
+
+        if proto != :tls # TLS options
+          raise ArgumentError, "BUG: certopts is available only for tls" if certopts
+        end
+        if proto != :tcp && proto != :tls # TCP/TLS options
+          raise ArgumentError, "BUG: linger_timeout is available for tcp/tls" if linger_timeout != 0
+        end
 
         case proto
         when :tcp
@@ -82,7 +94,7 @@ module Fluent
           raise "unknown protocol #{proto}"
         end
 
-        server_attach(title, port, bind, shared, server)
+        server_attach(title, proto, port, bind, shared, server)
       end
 
       # server_create(:title, @port) do |data|
@@ -97,11 +109,26 @@ module Fluent
       #   # ...
       # end
       def server_create(title, port, proto: :tcp, bind: '0.0.0.0', shared: true, certopts: nil, resolve_name: false, linger_timeout: 0, backlog: nil, max_bytes: nil, flags: 0, &callback)
-        raise ArgumentError, "BUG: title must be a symbol" unless title.is_a? Symbol
+        raise ArgumentError, "BUG: title must be a symbol" unless title && title.is_a?(Symbol)
+        raise ArgumentError, "BUG: port must be an integer" unless port && port.is_a?(Integer)
         raise ArgumentError, "BUG: invalid protocol name" unless PROTOCOLS.include?(proto)
 
         raise ArgumentError, "BUG: block not specified which handles received data" unless block_given?
         raise ArgumentError, "BUG: block must have 1 or 2 arguments" unless callback.arity == 1 || callback.arity == 2
+
+        if proto != :tls # TLS options
+          raise ArgumentError, "BUG: certopts is available only for tls" if certopts
+        end
+        if proto != :tcp && proto != :tls # TCP/TLS options
+          raise ArgumentError, "BUG: linger_timeout is available for tcp/tls" if linger_timeout != 0
+        end
+        if proto != :tcp && proto != :tls && proto != :unix # options to listen/accept connections
+          raise ArgumentError, "BUG: backlog is available for tcp/tls" if backlog
+        end
+        if proto != :udp # UDP options
+          raise ArgumentError, "BUG: max_bytes is available only for udp" if max_bytes
+          raise ArgumentError, "BUG: flags is available only for udp" if flags != 0
+        end
 
         case proto
         when :tcp
@@ -123,7 +150,7 @@ module Fluent
           raise "BUG: unknown protocol #{proto}"
         end
 
-        server_attach(title, port, bind, shared, server)
+        server_attach(title, proto, port, bind, shared, server)
       end
 
       def server_create_tcp(title, port, **kwargs, &callback)
@@ -134,10 +161,18 @@ module Fluent
         server_create(title, port, proto: :udp, **kwargs, &callback)
       end
 
-      ServerInfo = Struct.new(:title, :port, :bind, :shared, :server)
+      def server_create_tls(title, port, **kwargs, &callback)
+        server_create(title, port, proto: :tls, **kwargs, &callback)
+      end
 
-      def server_attach(title, port, bind, shared, server)
-        @_servers << ServerInfo.new(title, port, bind, shared, server)
+      def server_create_unix(title, port, **kwargs, &callback)
+        server_create(title, port, proto: :unix, **kwargs, &callback)
+      end
+
+      ServerInfo = Struct.new(:title, :proto, :port, :bind, :shared, :server)
+
+      def server_attach(title, proto, port, bind, shared, server)
+        @_servers << ServerInfo.new(title, proto, port, bind, shared, server)
         event_loop_attach(server)
       end
 
@@ -154,11 +189,16 @@ module Fluent
         @_servers = []
       end
 
+      def before_shutdown
+        @_servers.each do |si|
+        end
+        super
+      end
+
       def close
         @_servers.each do |si|
           si.server.close rescue nil
         end
-
         super
       end
 
@@ -209,6 +249,10 @@ module Fluent
       end
 
       class CallbackSocket
+        extend Forwardable
+
+        def_delegators :@sock, :send, :write
+
         def initialize(server_type, sock, enabled_events = [])
           @server_type = server_type
           @sock = sock
@@ -227,16 +271,16 @@ module Fluent
           @sock.peeraddr[1]
         end
 
-        def send(data, flag)
-          @sock.send(data, flag)
-        end
-
-        def write(data)
-          @sock.write(data)
-        end
-
         def close
-          @sock.close
+          # close cool.io socket in another thread, not to make deadlock
+          # for flushing @_write_buffer when conn.close is called in callback
+          ::Thread.new{
+            begin
+            @sock.close
+            rescue
+              p(here: "closing socket from callbacksocket", error: e)
+            end
+          }
         end
 
         def data(&callback)
@@ -249,11 +293,20 @@ module Fluent
           when :data
             @sock.data(&callback)
           when :write_complete
-            @sock.on_write_complete(&callback)
+            cb = ->(){
+              begin
+                callback.call(self)
+              rescue => e
+                p(here: "rescue in write_complete", error: e)
+                raise
+              end
+            }
+            @sock.on_write_complete(&cb)
           when :before_close
-            @sock.before_close(&callback)
+            @sock.before_close(&callback) # before_close is called with CallbackSocket by handler
           when :close
-            @sock.on_close(&callback)
+            cb = ->(){ callback.call(self) }
+            @sock.on_close(&cb)
           else
             raise "BUG: unknown event: #{event}"
           end
@@ -337,43 +390,55 @@ module Fluent
           def initialize(sock, resolve_name, linger_timeout, log, under_plugin_development, connect_callback)
             raise ArgumentError, "socket must be a TCPSocket" unless sock.is_a?(TCPSocket)
 
-            super(sock)
-
             sock_opt = [1, linger_timeout].pack(SOCK_OPT_FORMAT)
             sock.setsockopt(::Socket::SOL_SOCKET, ::Socket::SO_LINGER, sock_opt)
             sock.do_not_reverse_lookup = !resolve_name
 
-            @log = log
-            @connect_callback = connect_callback
+            @_handler_socket = sock
+            super(sock)
 
+            @log = log
             @under_plugin_development = under_plugin_development
 
+            @connect_callback = connect_callback
             @data_callback = nil
+            @before_close_callback = nil
+
+            @callback_connection = nil
             @closing = false
+
             @mutex = Mutex.new # to serialize #write and #close
+
+            # conn_mutex is used for 2 purposes:
+            # * to make registering data callback thread-safe
+            # * to control exclusive before-close-callback and actual close
+            @conn_mutex = Mutex.new
           end
 
           def data(&callback)
-            @data_callback = callback
-            on_read_impl = case callback.arity
-                           when 1 then :on_read_without_connection
-                           when 2 then :on_read_with_connection
-                           else
-                             raise "BUG: callback block must have 1 or 2 arguments"
-                           end
-            self.define_singleton_method(:on_read, method(on_read_impl))
+            @conn_mutex.synchronize do
+              raise "data callback can be registered just once, but registered twice" if self.singleton_methods.include?(:on_read)
+              @data_callback = callback
+              on_read_impl = case callback.arity
+                             when 1 then :on_read_without_connection
+                             when 2 then :on_read_with_connection
+                             else
+                               raise "BUG: callback block must have 1 or 2 arguments"
+                             end
+              self.define_singleton_method(:on_read, method(on_read_impl))
+            end
           end
 
           def write(data)
-            raise IOError, "server TCP connection is already going to be closed" if @closing
+            p(here: "going to write")
             @mutex.synchronize do
               super
             end
           end
 
           def on_connect
-            conn = TCPCallbackSocket.new(self)
-            @connect_callback.call(conn)
+            @callback_connection = TCPCallbackSocket.new(self)
+            @connect_callback.call(@callback_connection)
             unless @data_callback
               raise "connection callback must call #data to set data callback"
             end
@@ -389,7 +454,7 @@ module Fluent
           end
 
           def on_read_with_connection(data)
-            @data_callback.call(data, self)
+            @data_callback.call(data, @callback_connection)
           rescue => e
             @log.error "unexpected error on reading data", host: remote_host, port: remote_port, error: e
             @log.error_backtrace
@@ -397,12 +462,29 @@ module Fluent
             raise if @under_plugin_development
           end
 
+          def before_close(&callback)
+            @before_close_callback = callback
+          end
+
           def close(force = false)
-            @closing = true
-            if force
-              super()
-            else
-              @mutex.synchronize{ super() }
+            @conn_mutex.synchronize do
+              return if @closing && !force
+              @closing = true
+              if force || !attached? # if this socket already detached, this can't call any callbacks
+                return super()
+              end
+
+              if @before_close_callback
+                @before_close_callback.call(@callback_connection) rescue nil
+                @before_close_callback = nil
+              end
+              @mutex.synchronize do
+                if !@_write_buffer.empty?
+                  sleep 0.1 until @_write_buffer.empty?
+                end
+                @_handler_socket.flush # before_callback may call conn.write
+                super()
+              end
             end
           end
         end
